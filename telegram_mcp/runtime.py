@@ -138,14 +138,36 @@ def _install_annotation_hook() -> None:
 _install_annotation_hook()
 
 
-_EXPOSED_TOOLS_MODES = {"all", "read-only"}
+_EXPOSED_TOOLS_MODES = {"all", "read-only", "drafts"}
+
+# Tools that write to the account (so not readOnlyHint) but never deliver
+# anything to another party: they only stage a draft in the Telegram app's
+# own input field for a human to review and send manually. Safe to allow
+# alongside read-only tools under TELEGRAM_EXPOSED_TOOLS=drafts.
+_DRAFT_SAFE_TOOLS = {"save_draft", "clear_draft"}
+
+
+def _get_extra_write_tools() -> set[str]:
+    """Per-invocation additional mutating tools allowed on top of the mode.
+
+    Set via ``TELEGRAM_EXTRA_WRITE_TOOLS`` (comma-separated tool names) as a
+    real process env var on a specific MCP server invocation (e.g. a single
+    project's ``.mcp.json`` override), never via the shared ``.env`` used by
+    every session — that keeps a narrow, explicitly-authorized grant (e.g.
+    ``send_message,reply_to_message`` for one caller) from silently widening
+    to every session sharing the base ``TELEGRAM_EXPOSED_TOOLS`` mode.
+    """
+    raw = os.getenv("TELEGRAM_EXTRA_WRITE_TOOLS", "")
+    return {name.strip() for name in raw.split(",") if name.strip()}
 
 
 def _get_exposed_tools_mode(value: Optional[str] = None) -> str:
     """Return the configured MCP tool exposure mode.
 
     ``TELEGRAM_EXPOSED_TOOLS=read-only`` keeps only tools annotated with
-    ``readOnlyHint=True``. The default is ``all`` for backward compatibility.
+    ``readOnlyHint=True``. ``drafts`` additionally allows ``_DRAFT_SAFE_TOOLS``
+    (draft staging, no delivery to the other party). The default is ``all``
+    for backward compatibility.
     """
     raw_value = os.getenv("TELEGRAM_EXPOSED_TOOLS", "all") if value is None else value
     mode = raw_value.strip().lower()
@@ -163,8 +185,13 @@ def _apply_exposed_tools_mode(server: FastMCP = mcp, mode: Optional[str] = None)
     if selected_mode == "all":
         return []
 
+    extra_allowed = _get_extra_write_tools()
     removed: list[str] = []
     for tool in list(server._tool_manager.list_tools()):
+        if selected_mode == "drafts" and tool.name in _DRAFT_SAFE_TOOLS:
+            continue
+        if tool.name in extra_allowed:
+            continue
         annotations = getattr(tool, "annotations", None)
         if not getattr(annotations, "readOnlyHint", False):
             server._tool_manager.remove_tool(tool.name)
