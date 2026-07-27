@@ -214,6 +214,13 @@ For `http` and `sse`, the server binds `MCP_HOST`:`MCP_PORT` (default
 `127.0.0.1:8765`); the streamable HTTP endpoint is `/mcp`, the SSE endpoint is
 `/sse`.
 
+If the server is reachable via a domain (e.g. behind a reverse proxy) rather
+than only `127.0.0.1`/`localhost`, set `MCP_ALLOWED_HOSTS` (and optionally
+`MCP_ALLOWED_ORIGINS`) to enable DNS-rebinding protection and allow that Host
+header, e.g. `MCP_ALLOWED_HOSTS=mcp.example.com`. Comma-separated; supports a
+`:*` suffix to allow any port. Left unset, DNS-rebinding protection stays off
+(the historical default).
+
 Prefer `http` when more than one MCP client (or many coding-agent sessions)
 will use the server: a single long-lived process holds one Telegram
 connection, instead of every client spawning its own Telethon session —
@@ -263,6 +270,26 @@ Example prompts:
 
 - "List my accounts"
 - "Show unread messages from all accounts"
+
+### Session pool (one account, several concurrent clients)
+
+To run several MCP clients against the **same** Telegram account at once (for
+example the desktop app *and* a terminal CLI), give each client its own
+authorized session. Telegram forbids one session (auth key) being used from two
+IPs simultaneously, so on a VPN or dual-stack host two local clients can collide
+with `AuthKeyDuplicatedError`. List several interchangeable session strings in
+`TELEGRAM_SESSION_STRINGS` (separated by whitespace, comma or semicolon); each
+process claims a free one via an advisory file lock, so clients deterministically
+pick distinct sessions:
+
+```env
+TELEGRAM_SESSION_STRINGS=<session A> <session B> <session C>
+```
+
+Generate extra sessions with `uv run session_string_generator.py`. The pool
+takes precedence over `TELEGRAM_SESSION_STRING` for the default account. As an
+extra safety net, a transient `AuthKeyDuplicatedError` at connect time (e.g.
+during a VPN reconnect) is retried with backoff before the server gives up.
 - "Send this from my work account to @example"
 
 ## Device Identity
@@ -347,11 +374,16 @@ Allowed roots can come from:
 Security behavior:
 
 - Client MCP Roots replace server CLI roots when available.
+- Some clients (notably Cursor) return workspace roots as bare absolute paths
+  instead of `file://` URIs. That breaks MCP SDK validation of `list_roots`;
+  the server recovers those absolute paths from the validation error so
+  file-path tools keep working.
 - Empty client Roots are treated as deny-all by default. Some clients implement
   the Roots capability but advertise an empty list, which disables file tools
   even when server CLI roots are configured. Set
   `TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK=1` to fall back to the server CLI roots
-  in that case (opt-in; the default stays deny-all).
+  in that case (opt-in; the default stays deny-all). The same opt-in also applies
+  when `list_roots` fails unexpectedly and no client paths could be recovered.
 - Paths are resolved through real paths and must stay inside an allowed root.
 - Traversal, wildcard-like, shell-like, and null-byte path patterns are rejected.
 - Relative paths resolve under the first allowed root.

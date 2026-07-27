@@ -43,6 +43,11 @@ def _synthetic_mcp():
     return server
 
 
+def test_shared_server_uses_stateless_http_transport():
+    """A service restart must not invalidate long-lived Streamable HTTP clients."""
+    assert runtime.mcp.settings.stateless_http is True
+
+
 def test_get_exposed_tools_mode_defaults_to_all(monkeypatch):
     monkeypatch.delenv("TELEGRAM_EXPOSED_TOOLS", raising=False)
 
@@ -802,3 +807,117 @@ async def test_empty_client_roots_fallback_noop_without_server_roots(monkeypatch
     roots, status = await runtime._get_effective_allowed_roots_with_status(_ctx_with_roots([]))
     assert roots == []
     assert status == runtime.ROOTS_STATUS_CLIENT_DENY_ALL
+
+
+class _FailingRootsSession:
+    def __init__(self, error: Exception):
+        self._error = error
+
+    async def list_roots(self):
+        raise self._error
+
+
+def _ctx_with_list_roots_error(error: Exception):
+    return SimpleNamespace(session=_FailingRootsSession(error))
+
+
+def test_coerce_paths_from_list_roots_validation_error_recovers_bare_paths(tmp_path):
+    """Cursor-style bare absolute paths appear as pydantic url_parsing inputs."""
+    from pydantic import ValidationError
+    from mcp.types import ListRootsResult
+
+    root_a = tmp_path / "a"
+    root_b = tmp_path / "b"
+    root_a.mkdir()
+    root_b.mkdir()
+
+    with pytest.raises(ValidationError) as exc_info:
+        ListRootsResult.model_validate(
+            {
+                "roots": [
+                    {"uri": str(root_a)},
+                    {"uri": str(root_b)},
+                    {"uri": "not-a-path"},
+                ]
+            }
+        )
+
+    recovered = runtime._coerce_paths_from_list_roots_validation_error(exc_info.value)
+    assert root_a.resolve() in recovered
+    assert root_b.resolve() in recovered
+
+
+def test_coerce_paths_from_list_roots_validation_error_recovers_windows_paths():
+    """A Windows drive letter is reported as url_scheme, not url_parsing.
+
+    ``C:\\Users\\dev\\workspace`` gets far enough through pydantic's URL parsing
+    for the drive letter to be taken as the scheme, so validation fails with
+    ``url_scheme``. The path is hardcoded rather than derived from ``tmp_path``
+    so this case is exercised on POSIX CI as well as on Windows.
+    """
+    from pydantic import ValidationError
+    from mcp.types import ListRootsResult
+
+    windows_root = r"C:\Users\dev\workspace"
+
+    with pytest.raises(ValidationError) as exc_info:
+        ListRootsResult.model_validate({"roots": [{"uri": windows_root}]})
+
+    assert any(item.get("type") == "url_scheme" for item in exc_info.value.errors())
+
+    recovered = runtime._coerce_paths_from_list_roots_validation_error(exc_info.value)
+    assert recovered == [Path(windows_root).expanduser().resolve()]
+
+
+@pytest.mark.asyncio
+async def test_list_roots_validation_error_recovers_client_paths(tmp_path, monkeypatch):
+    from pydantic import ValidationError
+    from mcp.types import ListRootsResult
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [])
+    monkeypatch.delenv("TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK", raising=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        ListRootsResult.model_validate({"roots": [{"uri": str(root)}]})
+
+    roots, status = await runtime._get_effective_allowed_roots_with_status(
+        _ctx_with_list_roots_error(exc_info.value)
+    )
+    assert status == runtime.ROOTS_STATUS_READY
+    assert roots == [root.resolve()]
+
+    resolved, error = await runtime._ensure_allowed_roots(
+        _ctx_with_list_roots_error(exc_info.value), "download_media"
+    )
+    assert error is None
+    assert resolved == [root.resolve()]
+
+
+@pytest.mark.asyncio
+async def test_list_roots_unexpected_error_falls_back_when_opt_in(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [root.resolve()])
+    monkeypatch.setenv("TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK", "1")
+
+    roots, status = await runtime._get_effective_allowed_roots_with_status(
+        _ctx_with_list_roots_error(RuntimeError("boom"))
+    )
+    assert status == runtime.ROOTS_STATUS_SERVER_FALLBACK
+    assert roots == [root.resolve()]
+
+
+@pytest.mark.asyncio
+async def test_list_roots_unexpected_error_denies_without_opt_in(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [root.resolve()])
+    monkeypatch.delenv("TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK", raising=False)
+
+    roots, status = await runtime._get_effective_allowed_roots_with_status(
+        _ctx_with_list_roots_error(RuntimeError("boom"))
+    )
+    assert status == runtime.ROOTS_STATUS_ERROR
+    assert roots == []

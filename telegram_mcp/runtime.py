@@ -14,7 +14,6 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 # Third-party libraries
-import nest_asyncio
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import Annotations, TextContent, ToolAnnotations
@@ -42,6 +41,14 @@ from telethon.tl.types import (
     TextWithEntities,
 )
 import re
+import hashlib
+import tempfile
+
+try:
+    import fcntl  # POSIX advisory locks; unavailable on Windows
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
+
 from functools import wraps
 import telethon.errors.rpcerrorlist
 from sanitize import sanitize_user_content, sanitize_name, sanitize_dict, format_tool_result
@@ -103,7 +110,10 @@ load_dotenv()
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 
-mcp = FastMCP("telegram")
+# The shared HTTP service can be consumed by long-lived MCP clients. Stateless requests keep
+# those clients usable across server-process restarts instead of rejecting their next call
+# with "No valid session ID provided". Stdio transport remains unaffected.
+mcp = FastMCP("telegram", stateless_http=True)
 
 # Annotate all tool results with audience=["user"] so MCP clients know
 # the content is user-generated data, not instructions for the model.
@@ -307,11 +317,88 @@ def _build_client(session: Any, label: str) -> TelegramClient:
     return TelegramClient(session, TELEGRAM_API_ID, TELEGRAM_API_HASH, **kwargs)
 
 
+# --- Session pool ------------------------------------------------------------
+# A POOL of interchangeable authorized sessions for the SAME account lets
+# several concurrent MCP clients (e.g. the desktop app AND a terminal CLI) run
+# against one Telegram account without tripping AuthKeyDuplicatedError.
+#
+# Telegram forbids one auth key (one StringSession) being used from two IPs at
+# once; on a dual-stack / VPN host two local clients can egress via different
+# source IPs and collide. The fix is one authorized session PER concurrent
+# client (Telegram allows one account on many "devices"). Generate extra
+# sessions with `uv run session_string_generator.py` and list them in
+# TELEGRAM_SESSION_STRINGS (whitespace/comma/semicolon separated). Each process
+# claims the first session not already locked by a live process via an advisory
+# flock, so clients deterministically pick distinct slots; the OS releases the
+# lock if a process dies.
+
+# Acquired lock handles are held for the process lifetime so the advisory locks
+# stay held until exit (or crash, when the OS releases them).
+_SESSION_LOCKS: list = []
+
+
+def _parse_session_pool() -> List[str]:
+    """Parse TELEGRAM_SESSION_STRINGS into a de-duplicated list of sessions."""
+    raw = os.getenv("TELEGRAM_SESSION_STRINGS")
+    if not raw:
+        return []
+    pool: List[str] = []
+    for tok in re.split(r"[\s,;]+", raw.strip()):
+        if tok and tok not in pool:
+            pool.append(tok)
+    return pool
+
+
+def _acquire_session(pool: List[str]) -> str:
+    """Claim the first free session in the pool via an advisory file lock."""
+    if fcntl is None:
+        # No advisory locks (e.g. Windows): can't coordinate slots, so use the
+        # first session. For concurrent clients there, prefer distinct
+        # TELEGRAM_SESSION_STRING_<LABEL> accounts instead.
+        return pool[0]
+    lock_dir = os.path.join(tempfile.gettempdir(), "telegram-mcp-session-locks")
+    try:
+        os.makedirs(lock_dir, exist_ok=True)
+    except OSError:
+        lock_dir = tempfile.gettempdir()
+    for idx, session in enumerate(pool):
+        digest = hashlib.sha1(session.encode("utf-8")).hexdigest()[:16]
+        lock_path = os.path.join(lock_dir, f"session-{digest}.lock")
+        try:
+            fh = open(lock_path, "w")
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Locked by another live client — try the next session.
+            try:
+                fh.close()
+            except Exception:
+                pass
+            continue
+        _SESSION_LOCKS.append(fh)
+        try:
+            fh.write(f"pid={os.getpid()}\n")
+            fh.flush()
+        except OSError:
+            pass
+        print(f"Using Telegram session slot {idx + 1}/{len(pool)}.", file=sys.stderr)
+        return session
+    print(
+        f"WARNING: all {len(pool)} pooled Telegram session(s) are already in use "
+        "by other clients; reusing the first (may raise AuthKeyDuplicatedError). "
+        "Add another session to TELEGRAM_SESSION_STRINGS to run more clients.",
+        file=sys.stderr,
+    )
+    return pool[0]
+
+
 def _discover_accounts() -> dict[str, TelegramClient]:
     """Scan env vars to build account label -> TelegramClient mapping.
 
     Detection rules:
     - TELEGRAM_SESSION_STRING_<LABEL> / TELEGRAM_SESSION_NAME_<LABEL> -> multi-mode
+    - TELEGRAM_SESSION_STRINGS (whitespace/comma/semicolon separated) -> a pool
+      of interchangeable sessions for the default account; each process claims a
+      free slot to avoid AuthKeyDuplicatedError (takes precedence for "default")
     - Unsuffixed TELEGRAM_SESSION_STRING / TELEGRAM_SESSION_NAME -> label "default"
     - If both suffixed and unsuffixed exist -> unsuffixed becomes "default"
 
@@ -331,14 +418,21 @@ def _discover_accounts() -> dict[str, TelegramClient]:
             label = key[len(prefix_name) :].lower()
             accounts[label] = _build_client(value, label)
 
-    # Backward-compatible unsuffixed variables
+    # Backward-compatible unsuffixed variables. A pool (TELEGRAM_SESSION_STRINGS)
+    # takes precedence for the default account and claims a free session slot.
+    session_pool = _parse_session_pool()
     session_string = os.getenv("TELEGRAM_SESSION_STRING")
     session_name = os.getenv("TELEGRAM_SESSION_NAME")
 
-    if session_string and "default" not in accounts:
-        accounts["default"] = _build_client(StringSession(session_string), "default")
-    elif session_name and "default" not in accounts:
-        accounts["default"] = _build_client(session_name, "default")
+    if "default" not in accounts:
+        if session_pool:
+            accounts["default"] = _build_client(
+                StringSession(_acquire_session(session_pool)), "default"
+            )
+        elif session_string:
+            accounts["default"] = _build_client(StringSession(session_string), "default")
+        elif session_name:
+            accounts["default"] = _build_client(session_name, "default")
 
     if not accounts:
         print(
@@ -1011,10 +1105,55 @@ def _is_roots_unsupported_error(error: Exception) -> bool:
     return False
 
 
+def _coerce_paths_from_list_roots_validation_error(error: Exception) -> List[Path]:
+    """Recover absolute filesystem roots when a client sends bare paths.
+
+    Some MCP clients (notably Cursor) return workspace roots as plain absolute
+    paths instead of ``file://`` URIs. The MCP SDK then fails pydantic validation
+    of ``ListRootsResult`` even though the roots themselves are usable. Extract
+    those paths from the validation error payload so file-path tools keep working.
+
+    Which error pydantic reports depends on the path's shape. A POSIX path like
+    ``/home/dev/ws`` has no scheme at all and yields ``url_parsing``, but on a
+    Windows path like ``C:\\Users\\dev\\ws`` the drive letter parses as a scheme,
+    so pydantic gets far enough to reject it as ``url_scheme`` instead. Accept
+    both, or the Windows branch below is unreachable.
+    """
+    errors_fn = getattr(error, "errors", None)
+    if not callable(errors_fn):
+        return []
+
+    try:
+        details = errors_fn()
+    except Exception:
+        return []
+
+    recovered: List[Path] = []
+    for item in details:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in ("url_parsing", "url_scheme"):
+            continue
+        value = item.get("input")
+        if not isinstance(value, str):
+            continue
+        candidate = value.strip()
+        if not (candidate.startswith("/") or (len(candidate) > 2 and candidate[1] == ":")):
+            # Unix absolute path, or Windows drive path like C:\...
+            continue
+        try:
+            recovered.append(Path(candidate).expanduser().resolve())
+        except Exception:
+            continue
+    return _dedupe_paths(recovered)
+
+
 def _server_roots_fallback_enabled(value: Optional[str] = None) -> bool:
-    """Whether an empty client roots list should fall back to server CLI roots.
+    """Whether server CLI roots may replace unusable/empty client Roots.
 
     Opt-in via the ``TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK`` environment variable.
+    Applies when the client returns an empty roots list, or when ``list_roots``
+    fails with an unexpected error (after any recoverable client paths are tried).
     Defaults to ``False`` to preserve the safe deny-all behavior.
     """
     raw_value = os.getenv("TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK") if value is None else value
@@ -1033,10 +1172,26 @@ async def _get_effective_allowed_roots_with_status(
     try:
         list_roots_result = await ctx.session.list_roots()
     except Exception as error:
+        recovered_roots = _coerce_paths_from_list_roots_validation_error(error)
+        if recovered_roots:
+            logger.warning(
+                "MCP client returned non-URI roots; recovered %d path(s) from validation error.",
+                len(recovered_roots),
+            )
+            return recovered_roots, ROOTS_STATUS_READY
         if _is_roots_unsupported_error(error):
             if fallback_roots:
                 return fallback_roots, ROOTS_STATUS_UNSUPPORTED_FALLBACK
             return [], ROOTS_STATUS_NOT_CONFIGURED
+        # Unexpected list_roots failures (e.g. malformed client payloads that we
+        # could not recover). Match empty-list behavior: opt-in server fallback.
+        if fallback_roots and _server_roots_fallback_enabled():
+            logger.warning(
+                "MCP roots request failed; falling back to server CLI roots "
+                "(TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK).",
+                exc_info=True,
+            )
+            return fallback_roots, ROOTS_STATUS_SERVER_FALLBACK
         logger.error(
             "MCP roots request failed; disabling file-path tools for safety.", exc_info=True
         )
