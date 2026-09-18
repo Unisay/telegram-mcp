@@ -235,8 +235,9 @@ async def list_topics(
     """
     Retrieve forum topics from a supergroup with the forum feature enabled.
 
-    Note for LLM: You can send a message to a selected topic via reply_to_message tool
-    by using Topic ID as the message_id parameter.
+    Note for LLM: Send into a topic by passing Topic ID as topic_id to send_file /
+    send_album / send_voice / send_sticker / send_gif, or as message_id to
+    reply_to_message for text.
 
     Args:
         chat_id: The ID of the forum-enabled chat (supergroup).
@@ -562,10 +563,8 @@ async def list_chats(
                     elif isinstance(entity, User):
                         full = await cl(functions.users.GetFullUserRequest(id=entity))
                         about_text = getattr(full.full_user, "about", "") or ""
-                except Exception as about_err:
-                    logger.warning(
-                        f"list_chats: failed to fetch about for {entity.id}: {about_err}"
-                    )
+                except Exception:
+                    logger.warning("list_chats: failed to fetch one chat description")
                     about_text = "<error fetching description>"
 
                 record["about"] = sanitize_user_content(about_text, max_length=200)
@@ -636,6 +635,16 @@ async def get_chat(chat_id: Union[int, str], account: str = None) -> str:
             record["bot"] = bool(entity.bot)
             record["verified"] = bool(entity.verified)
 
+        # Photo presence — the entity carries ChatPhoto/ChatPhotoEmpty (chats/channels)
+        # or UserProfilePhoto/UserProfilePhotoEmpty (users). Surfaced so callers can
+        # detect chats that have no avatar set.
+        photo = getattr(entity, "photo", None)
+        record["has_photo"] = photo is not None and not isinstance(
+            photo, (types.ChatPhotoEmpty, types.UserProfilePhotoEmpty)
+        )
+        if record["has_photo"]:
+            record["current_avatar_id"] = getattr(photo, "photo_id", None)
+
         # Get unread count + last activity for THIS specific peer.
         #
         # NOTE: do NOT use get_dialogs(limit=1, offset_peer=entity) here. In
@@ -674,8 +683,8 @@ async def get_chat(chat_id: Union[int, str], account: str = None) -> str:
                     "date": last_msg.date,
                     "text": sanitize_user_content(last_msg.message),
                 }
-        except Exception as diag_ex:
-            logger.warning(f"Could not get dialog info for {chat_id}: {diag_ex}")
+        except Exception:
+            logger.warning("Could not get requested dialog metadata")
 
         return format_tool_result([], metadata=record)
     except Exception as e:
@@ -735,17 +744,35 @@ async def get_full_chat(chat_id: Union[int, str], account: str = None) -> str:
         cl = get_client(account)
         await ensure_connected(cl)
         entity = await resolve_entity(chat_id, cl)
-        full = await cl(functions.channels.GetFullChannelRequest(channel=entity))
+
+        # Basic ("legacy") groups are not channels: GetFullChannelRequest cannot
+        # cast an InputPeerChat and raises TypeError. They are served by
+        # messages.GetFullChatRequest instead.
+        if isinstance(entity, (Chat, InputPeerChat)):
+            basic_id = getattr(entity, "chat_id", None) or getattr(entity, "id", None)
+            full = await cl(functions.messages.GetFullChatRequest(chat_id=basic_id))
+        else:
+            full = await cl(functions.channels.GetFullChannelRequest(channel=entity))
 
         chat = full.chats[0] if full.chats else None
         full_chat = full.full_chat
+
+        # Channels carry participants_count on the full object; basic groups only
+        # carry the member list, so count that instead.
+        participants_count = getattr(full_chat, "participants_count", None)
+        if participants_count is None:
+            members = getattr(getattr(full_chat, "participants", None), "participants", None)
+            if members is not None:
+                participants_count = len(members)
 
         result = {
             "id": get_marked_id(chat) if chat else None,
             "title": sanitize_name(getattr(chat, "title", None)) if chat else None,
             "username": getattr(chat, "username", None) if chat else None,
-            "about": sanitize_user_content(full_chat.about or "", max_length=1024),
-            "participants_count": getattr(full_chat, "participants_count", None),
+            "about": sanitize_user_content(
+                getattr(full_chat, "about", None) or "", max_length=1024
+            ),
+            "participants_count": participants_count,
             "linked_chat_id": getattr(full_chat, "linked_chat_id", None),
         }
 
@@ -792,10 +819,8 @@ async def mute_chat(chat_id: Union[int, str], account: str = None) -> str:
             )
             return f"Chat {chat_id} muted (using alternative method)."
         except Exception as alt_e:
-            logger.exception(f"mute_chat (alt method) failed (chat_id={chat_id})")
             return log_and_format_error("mute_chat", alt_e, chat_id=chat_id)
     except Exception as e:
-        logger.exception(f"mute_chat failed (chat_id={chat_id})")
         return log_and_format_error("mute_chat", e, chat_id=chat_id)
 
 
@@ -837,10 +862,8 @@ async def unmute_chat(chat_id: Union[int, str], account: str = None) -> str:
             )
             return f"Chat {chat_id} unmuted (using alternative method)."
         except Exception as alt_e:
-            logger.exception(f"unmute_chat (alt method) failed (chat_id={chat_id})")
             return log_and_format_error("unmute_chat", alt_e, chat_id=chat_id)
     except Exception as e:
-        logger.exception(f"unmute_chat failed (chat_id={chat_id})")
         return log_and_format_error("unmute_chat", e, chat_id=chat_id)
 
 
@@ -943,9 +966,6 @@ async def get_common_chats(
 
         return "\n".join(lines)
     except Exception as e:
-        logger.exception(
-            f"get_common_chats failed (user_id={user_id}, limit={limit}, max_id={max_id})"
-        )
         return log_and_format_error(
             "get_common_chats", e, user_id=user_id, limit=limit, max_id=max_id
         )
@@ -1034,9 +1054,6 @@ async def get_message_read_by(
             default=json_serializer,
         )
     except Exception as e:
-        logger.exception(
-            f"get_message_read_by failed (chat_id={chat_id}, message_id={message_id})"
-        )
         return log_and_format_error(
             "get_message_read_by", e, chat_id=chat_id, message_id=message_id
         )
@@ -1090,10 +1107,6 @@ async def get_message_link(
             output += f"\nHTML: {html}"
         return output
     except Exception as e:
-        logger.exception(
-            f"get_message_link failed (chat_id={chat_id}, message_id={message_id}, "
-            f"thread={thread})"
-        )
         return log_and_format_error(
             "get_message_link",
             e,
