@@ -7,7 +7,7 @@ try:
 except UnsafeInstallationError as exc:
     raise SystemExit(str(exc)) from None
 
-from telethon.errors import AuthKeyDuplicatedError
+from telethon.errors import AuthKeyDuplicatedError, BotMethodInvalidError
 
 from telegram_mcp import runtime as _runtime
 from telegram_mcp import transcription as _transcription
@@ -170,8 +170,19 @@ async def _main() -> None:
         print("Warming entity caches (background)...", file=sys.stderr)
 
         async def _warm_caches() -> None:
+            async def _warm_client(label: str, cl: TelegramClient) -> None:
+                try:
+                    await cl.get_dialogs()
+                except BotMethodInvalidError:
+                    print(
+                        f"Skipping entity cache pre-warm for bot client '{label}' (dialogs restricted for bots).",
+                        file=sys.stderr,
+                    )
+                except Exception as exc:
+                    print(f"Entity cache warm failed for '{label}': {exc}", file=sys.stderr)
+
             try:
-                await asyncio.gather(*(cl.get_dialogs() for cl in clients.values()))
+                await asyncio.gather(*(_warm_client(label, cl) for label, cl in clients.items()))
                 print("Entity caches warmed.", file=sys.stderr)
             except Exception as warm_exc:
                 print(f"Entity cache warm failed: {warm_exc}", file=sys.stderr)
@@ -179,10 +190,31 @@ async def _main() -> None:
         warm_task = asyncio.create_task(_warm_caches())
 
         transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
-        print(
-            f"Telegram client(s) started ({labels}). Running MCP server ({transport})...",
-            file=sys.stderr,
-        )
+
+        # Validate transport mode
+        VALID_TRANSPORTS = ("stdio", "http", "sse")
+        if transport not in VALID_TRANSPORTS:
+            accepted = ", ".join(VALID_TRANSPORTS)
+            print(
+                f"Invalid MCP_TRANSPORT '{transport}'. Expected one of: {accepted}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Startup log with host:port for HTTP/SSE transports
+        if transport in ("http", "sse"):
+            host = os.getenv("MCP_HOST", "127.0.0.1")
+            port = os.getenv("MCP_PORT", "8765")
+            print(
+                f"Telegram client(s) started ({labels}). Running MCP server ({transport}) on {host}:{port}...",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Telegram client(s) started ({labels}). Running MCP server ({transport})...",
+                file=sys.stderr,
+            )
+
         await _serve(transport)
     except Exception as e:
         print(f"Error starting client: {e}", file=sys.stderr)
@@ -218,6 +250,23 @@ async def _main() -> None:
 
 def main() -> None:
     _configure_allowed_roots_from_cli(sys.argv[1:])
+    # Apply CLI transport/host/port overrides to environment (runtime sets globals)
+    transport = _runtime._CLI_TRANSPORT or "stdio"
+    host = _runtime._CLI_HOST
+    port = _runtime._CLI_PORT
+
+    if transport != "stdio":
+        os.environ["MCP_TRANSPORT"] = transport
+    if host:
+        os.environ["MCP_HOST"] = host
+    if port is not None:
+        os.environ["MCP_PORT"] = str(port)
+    # Before _apply_exposed_tools_mode(): that prunes non-exposed tools from
+    # the tool manager, and the extension overrides validate tool names
+    # against that same manager. Narrowing send_file's extensions while
+    # send_file is not exposed is a valid configuration, so the name check
+    # has to see the full tool set.
+    _runtime._apply_file_extension_overrides()
     _runtime._apply_exposed_tools_mode()
     _transcription.validate_transcription_config()
     _session_lock_shared()  # fail loudly at startup on a bad toggle
