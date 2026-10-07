@@ -9,6 +9,13 @@ import sqlite3
 import logging
 import mimetypes
 import unicodedata
+
+# Ensure sys.stderr is reconfigured for UTF-8 on Windows where possible
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        pass
 from contextlib import contextmanager
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
@@ -18,8 +25,11 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 # Third-party libraries
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 from mcp.server.fastmcp import FastMCP, Context, Image
+from mcp.server.fastmcp.exceptions import ToolError
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from mcp.types import Annotations, ImageContent, TextContent, ToolAnnotations
 from mcp.shared.exceptions import McpError
 from pythonjsonlogger import jsonlogger
@@ -514,8 +524,52 @@ def _get_flood_sleep_threshold() -> int:
         return 60
 
 
+def _resolve_session_path(session_name: str) -> str:
+    """Resolve a relative session name against the project root.
+
+    When TELEGRAM_SESSION_NAME is a relative path/name (e.g. 'my_session' or
+    'sessions/main'), running from a different working directory makes Telethon
+    search os.getcwd() and fail to find the existing .session file, triggering
+    an interactive login prompt.
+    This resolves the relative path against the repository/project root (or the
+    directory where .env was found) if the file exists there, or if running
+    from a subdirectory of the project root.
+    """
+    if not session_name or os.path.isabs(session_name) or session_name == ":memory:":
+        return session_name
+
+    candidate_roots = [PROJECT_ROOT]
+    try:
+        env_file = find_dotenv()
+        if env_file:
+            env_dir = os.path.dirname(os.path.abspath(env_file))
+            if env_dir not in candidate_roots:
+                candidate_roots.append(env_dir)
+    except Exception:
+        pass
+
+    for root in candidate_roots:
+        target = os.path.join(root, session_name)
+        target_session = target if target.endswith(".session") else f"{target}.session"
+        if os.path.exists(target) or os.path.exists(target_session):
+            return target
+
+    # If running from a subdirectory of project root, resolve to project root
+    # so subdirectories don't lose the session file
+    cwd = os.path.abspath(os.getcwd())
+    try:
+        if os.path.commonpath([cwd, PROJECT_ROOT]) == PROJECT_ROOT and cwd != PROJECT_ROOT:
+            return os.path.join(PROJECT_ROOT, session_name)
+    except ValueError:
+        pass
+
+    return session_name
+
+
 def _build_client(session: Any, label: str) -> TelegramClient:
     """Construct a ``TelegramClient`` honoring per-label proxy and flood sleep configuration."""
+    if isinstance(session, str):
+        session = _resolve_session_path(session)
     proxy, connection = _build_proxy_for_label(label)
     kwargs: dict[str, Any] = {}
     if proxy is not None:
@@ -630,7 +684,7 @@ def _discover_accounts() -> dict[str, TelegramClient]:
             accounts[label] = _build_client(StringSession(value), label)
         elif key.startswith(prefix_name) and value:
             label = key[len(prefix_name) :].lower()
-            accounts[label] = _build_client(value, label)
+            accounts[label] = _build_client(_resolve_session_path(value), label)
 
     # Backward-compatible unsuffixed variables. A pool (TELEGRAM_SESSION_STRINGS)
     # takes precedence for the default account and claims a free session slot.
@@ -646,7 +700,7 @@ def _discover_accounts() -> dict[str, TelegramClient]:
         elif session_string:
             accounts["default"] = _build_client(StringSession(session_string), "default")
         elif session_name:
-            accounts["default"] = _build_client(session_name, "default")
+            accounts["default"] = _build_client(_resolve_session_path(session_name), "default")
 
     if not accounts:
         print(
@@ -688,6 +742,8 @@ def with_account(readonly=False):
     - In multi-mode with explicit account: uses that account's client.
     - In multi-mode without account + readonly: fans out to all accounts
       concurrently, prefixes each result with [label], concatenates.
+      ToolError failures are labelled alongside successful results; if every
+      account raises ToolError, the combined failure is raised instead.
     - In multi-mode without account + NOT readonly: returns an error.
 
     The wrapped function must accept ``account: str = None`` and use
@@ -712,14 +768,24 @@ def with_account(readonly=False):
             async def _call_for(label):
                 kw = dict(kwargs)
                 kw["account"] = label
-                return label, await fn(*args, **kw)
+                try:
+                    result = await fn(*args, **kw)
+                    failed = False
+                except ToolError as error:
+                    result = str(error)
+                    failed = True
+                return label, result, failed
 
             results = await asyncio.gather(*(_call_for(label) for label in clients))
-            if all(isinstance(result, str) for _, result in results):
-                return "\n\n".join(f"[{label}]\n{result}" for label, result in results)
+            if all(failed for _, _, failed in results):
+                raise ToolError(
+                    "\n\n".join(f"[{label}]\n{result}" for label, result, _ in results)
+                )
+            if all(isinstance(result, str) for _, result, _ in results):
+                return "\n\n".join(f"[{label}]\n{result}" for label, result, _ in results)
 
             account_labelled_content = []
-            for label, result in results:
+            for label, result, _ in results:
                 account_labelled_content.append(f"[{label}]")
                 account_labelled_content.extend(result if isinstance(result, list) else [result])
             return account_labelled_content
@@ -760,8 +826,16 @@ async def _force_reconnect(cl: TelegramClient):
             f"Reconnecting to Telegram timed out after {_RECONNECT_TIMEOUT:.0f}s."
         ) from exc
     if not await cl.is_user_authorized():
-        reconnect_logger.warning("Client not authorized after reconnect, calling start()...")
-        await asyncio.wait_for(cl.start(), timeout=_RECONNECT_TIMEOUT)
+        # cl.start() would prompt via blocking input(): it stalls the event loop
+        # and, over stdio, reads protocol frames as a phone number.
+        try:
+            await cl.disconnect()
+        except Exception:
+            pass
+        raise RuntimeError(
+            "Telegram session is not authorized after reconnect. Re-authorize it "
+            "outside the server (session_string_generator.py) and restart."
+        )
     _last_conn_verified[id(cl)] = time.time()
     reconnect_logger.warning("Forced reconnect successful")
 
@@ -812,11 +886,11 @@ console_handler.setLevel(logging.ERROR)  # Set to ERROR for production, INFO for
 # Create file handler with absolute path. Keep the legacy location next to
 # top-level main.py, even though runtime code now lives inside telegram_mcp/.
 package_dir = os.path.dirname(os.path.abspath(__file__))
-script_dir = os.path.dirname(package_dir)
+script_dir = PROJECT_ROOT
 log_file_path = os.path.join(script_dir, "mcp_errors.log")
 
 try:
-    file_handler = logging.FileHandler(log_file_path, mode="a")  # Append mode
+    file_handler = logging.FileHandler(log_file_path, mode="a", encoding="utf-8")  # Append mode
     file_handler.setLevel(logging.ERROR)
 
     # Create formatters
@@ -873,6 +947,7 @@ ROOTS_STATUS_NOT_CONFIGURED = "not_configured"
 ROOTS_STATUS_UNSUPPORTED_FALLBACK = "unsupported_fallback"
 ROOTS_STATUS_CLIENT_DENY_ALL = "client_deny_all"
 ROOTS_STATUS_SERVER_FALLBACK = "server_fallback"
+ROOTS_STATUS_SERVER_ONLY = "server_only"
 ROOTS_STATUS_ERROR = "error"
 ROOTS_STATUS_TIMEOUT = "timeout"
 # Some clients accept the server-initiated roots/list request but never answer
@@ -1132,12 +1207,19 @@ def log_and_format_error(
     return f"An error occurred (code: {error_code})."
 
 
-def validate_id(*param_names_to_validate):
+def validate_id(*param_names_to_validate, raise_errors=False):
     """
     Decorator to validate chat_id and user_id parameters, including lists of IDs.
     It checks for valid integer ranges, string representations of integers,
     and username formats.
+    Set raise_errors to surface validation/privacy failures as MCP tool errors;
+    other tools retain their existing return contract by default.
     """
+
+    def error_result(message):
+        if raise_errors:
+            raise ToolError(message)
+        return message
 
     def decorator(func):
         @wraps(func)
@@ -1194,24 +1276,28 @@ def validate_id(*param_names_to_validate):
                     for item in param_value:
                         validated_item, error_msg = validate_single_id(item, param_name)
                         if error_msg:
-                            return log_and_format_error(
-                                func.__name__,
-                                ValidationError(error_msg),
-                                prefix="VALIDATION-001",
-                                user_message=error_msg,
-                                **{param_name: param_value},
+                            return error_result(
+                                log_and_format_error(
+                                    func.__name__,
+                                    ValidationError(error_msg),
+                                    prefix="VALIDATION-001",
+                                    user_message=error_msg,
+                                    **{param_name: param_value},
+                                )
                             )
                         validated_list.append(validated_item)
                     kwargs[param_name] = validated_list
                 else:
                     validated_value, error_msg = validate_single_id(param_value, param_name)
                     if error_msg:
-                        return log_and_format_error(
-                            func.__name__,
-                            ValidationError(error_msg),
-                            prefix="VALIDATION-001",
-                            user_message=error_msg,
-                            **{param_name: param_value},
+                        return error_result(
+                            log_and_format_error(
+                                func.__name__,
+                                ValidationError(error_msg),
+                                prefix="VALIDATION-001",
+                                user_message=error_msg,
+                                **{param_name: param_value},
+                            )
                         )
                     kwargs[param_name] = validated_value
 
@@ -1235,12 +1321,14 @@ def validate_id(*param_names_to_validate):
                                     pass
                             if not resolved_allowed:
                                 err = check_chat_access(item)
-                                return log_and_format_error(
-                                    func.__name__,
-                                    ChatAccessDeniedError(err),
-                                    prefix=ErrorCategory.PRIVACY,
-                                    user_message=err,
-                                    **{param_name: param_value},
+                                return error_result(
+                                    log_and_format_error(
+                                        func.__name__,
+                                        ChatAccessDeniedError(err),
+                                        prefix=ErrorCategory.PRIVACY,
+                                        user_message=err,
+                                        **{param_name: param_value},
+                                    )
                                 )
 
             return await func(*args, **kwargs)
@@ -2103,6 +2191,12 @@ def _server_roots_fallback_enabled(value: Optional[str] = None) -> bool:
     return _parse_bool_env(raw_value, False)
 
 
+def _server_roots_only_enabled(value: Optional[str] = None) -> bool:
+    """TELEGRAM_SERVER_ROOTS_ONLY: use server roots and skip roots/list (default off)."""
+    raw_value = os.getenv("TELEGRAM_SERVER_ROOTS_ONLY") if value is None else value
+    return _parse_bool_env(raw_value, False)
+
+
 def _roots_request_timeout(value: Optional[str] = None) -> Optional[float]:
     """Seconds to wait for the client's ``roots/list`` reply.
 
@@ -2127,6 +2221,8 @@ async def _get_effective_allowed_roots_with_status(
         if fallback_roots:
             return fallback_roots, ROOTS_STATUS_READY
         return [], ROOTS_STATUS_NOT_CONFIGURED
+    if fallback_roots and _server_roots_only_enabled():
+        return fallback_roots, ROOTS_STATUS_SERVER_ONLY
 
     try:
         timeout = _roots_request_timeout()
@@ -2216,6 +2312,7 @@ async def _ensure_allowed_roots(
                 (
                     f"{tool_name} is disabled because the MCP client never answered the "
                     "roots/list request. Configure server CLI roots and set "
+                    "TELEGRAM_SERVER_ROOTS_ONLY=1 (skip roots/list) or "
                     "TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK=1, or raise "
                     "TELEGRAM_ROOTS_TIMEOUT_SECONDS."
                 ),

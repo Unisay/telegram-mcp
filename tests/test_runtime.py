@@ -1,5 +1,8 @@
 import asyncio
 import json
+import logging
+import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -542,13 +545,40 @@ class _ConnectivityClient:
 
 @pytest.mark.asyncio
 async def test_ensure_connected_reconnects_disconnected_client(monkeypatch):
-    client = _ConnectivityClient(connected=False, authorized=False)
+    client = _ConnectivityClient(connected=False, authorized=True)
     monkeypatch.setattr(runtime, "_last_conn_verified", {})
 
     await runtime.ensure_connected(client)
 
-    assert client.calls == ["is_connected", "disconnect", "connect", "is_user_authorized", "start"]
+    assert client.calls == ["is_connected", "disconnect", "connect", "is_user_authorized"]
     assert runtime._last_conn_verified[id(client)] > 0
+
+
+@pytest.mark.asyncio
+async def test_force_reconnect_never_starts_interactive_login(monkeypatch):
+    client = _ConnectivityClient(connected=False, authorized=False)
+    monkeypatch.setattr(runtime, "_last_conn_verified", {})
+
+    with pytest.raises(RuntimeError, match="not authorized after reconnect") as excinfo:
+        await runtime._force_reconnect(client)
+
+    assert "session_string_generator.py" in str(excinfo.value)
+    assert "start" not in client.calls
+    # The unauthorized connection is dropped so the next tool call reconnects
+    # and reports the same error instead of reusing a half-open session.
+    assert client.calls == ["disconnect", "connect", "is_user_authorized", "disconnect"]
+    assert id(client) not in runtime._last_conn_verified
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_surfaces_revoked_session(monkeypatch):
+    client = _ConnectivityClient(connected=False, authorized=False)
+    monkeypatch.setattr(runtime, "_last_conn_verified", {})
+
+    with pytest.raises(RuntimeError, match="not authorized after reconnect"):
+        await runtime.ensure_connected(client)
+
+    assert "start" not in client.calls
 
 
 @pytest.mark.asyncio
@@ -1202,6 +1232,99 @@ async def test_list_roots_timeout_denies_without_opt_in(tmp_path, monkeypatch):
     )
     assert error is not None
     assert "roots/list" in error
+    assert "TELEGRAM_SERVER_ROOTS_ONLY" in error
+
+
+class _RootsSessionThatMustNotBeCalled:
+    """Client that would hang on roots/list; the server must not ask it."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def list_roots(self):
+        self.calls += 1
+        await asyncio.sleep(3600)
+
+
+def test_server_roots_only_enabled_parsing(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_SERVER_ROOTS_ONLY", raising=False)
+    assert runtime._server_roots_only_enabled() is False
+    assert runtime._server_roots_only_enabled("1") is True
+    assert runtime._server_roots_only_enabled("true") is True
+    assert runtime._server_roots_only_enabled("off") is False
+    monkeypatch.setenv("TELEGRAM_SERVER_ROOTS_ONLY", "yes")
+    assert runtime._server_roots_only_enabled() is True
+
+
+@pytest.mark.asyncio
+async def test_server_roots_only_skips_client_roots_request(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [root.resolve()])
+    monkeypatch.setenv("TELEGRAM_SERVER_ROOTS_ONLY", "1")
+    monkeypatch.delenv("TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK", raising=False)
+    monkeypatch.delenv("TELEGRAM_ROOTS_TIMEOUT_SECONDS", raising=False)
+    session = _RootsSessionThatMustNotBeCalled()
+    ctx = SimpleNamespace(session=session)
+
+    roots, status = await asyncio.wait_for(
+        runtime._get_effective_allowed_roots_with_status(ctx), timeout=1
+    )
+    assert status == runtime.ROOTS_STATUS_SERVER_ONLY
+    assert roots == [root.resolve()]
+
+    resolved, error = await asyncio.wait_for(
+        runtime._ensure_allowed_roots(ctx, "download_media"), timeout=1
+    )
+    assert error is None
+    assert resolved == [root.resolve()]
+    assert session.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_server_roots_only_ignores_client_roots_when_server_roots_set(tmp_path, monkeypatch):
+    server_root = tmp_path / "server"
+    client_root = tmp_path / "client"
+    server_root.mkdir()
+    client_root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [server_root.resolve()])
+    monkeypatch.setenv("TELEGRAM_SERVER_ROOTS_ONLY", "1")
+
+    roots, status = await runtime._get_effective_allowed_roots_with_status(
+        _ctx_with_roots([SimpleNamespace(uri=client_root.as_uri())])
+    )
+    assert status == runtime.ROOTS_STATUS_SERVER_ONLY
+    assert roots == [server_root.resolve()]
+
+
+@pytest.mark.asyncio
+async def test_server_roots_only_keeps_client_roots_without_server_roots(tmp_path, monkeypatch):
+    client_root = tmp_path / "client"
+    client_root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [])
+    monkeypatch.setenv("TELEGRAM_SERVER_ROOTS_ONLY", "1")
+
+    roots, status = await runtime._get_effective_allowed_roots_with_status(
+        _ctx_with_roots([SimpleNamespace(uri=client_root.as_uri())])
+    )
+    assert status == runtime.ROOTS_STATUS_READY
+    assert roots == [client_root.resolve()]
+
+
+@pytest.mark.asyncio
+async def test_client_roots_still_replace_server_roots_by_default(tmp_path, monkeypatch):
+    server_root = tmp_path / "server"
+    client_root = tmp_path / "client"
+    server_root.mkdir()
+    client_root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [server_root.resolve()])
+    monkeypatch.delenv("TELEGRAM_SERVER_ROOTS_ONLY", raising=False)
+
+    roots, status = await runtime._get_effective_allowed_roots_with_status(
+        _ctx_with_roots([SimpleNamespace(uri=client_root.as_uri())])
+    )
+    assert status == runtime.ROOTS_STATUS_READY
+    assert roots == [client_root.resolve()]
 
 
 def test_get_file_extension_overrides_rejects_duplicate_tool_name():
@@ -1253,3 +1376,101 @@ async def test_send_file_override_bites_on_the_real_resolution_path(tmp_path, mo
     )
     assert error is None
     assert resolved == allowed
+
+
+def test_file_handler_encoding_is_utf8():
+    """Ensure runtime file_handler specifies utf-8 encoding."""
+    assert runtime.file_handler.encoding.lower() in ("utf-8", "utf8")
+
+
+def test_file_handler_handles_non_ascii_and_emojis(tmp_path):
+    """Ensure logging emojis and non-ASCII characters does not raise UnicodeEncodeError."""
+    log_file = tmp_path / "test_unicode.log"
+    handler = logging.FileHandler(str(log_file), mode="a", encoding="utf-8")
+    test_logger = logging.getLogger("test_unicode_logger")
+    test_logger.setLevel(logging.INFO)
+    test_logger.addHandler(handler)
+    try:
+        msg = "Test log with non-ASCII and emojis: 🔥 🚀 café русский 简体中文"
+        test_logger.info(msg)
+        handler.flush()
+        content = log_file.read_text(encoding="utf-8")
+        assert msg in content
+    finally:
+        test_logger.removeHandler(handler)
+        handler.close()
+
+
+def test_runtime_logger_logs_unicode_without_error():
+    """Ensure runtime.logger can log unicode characters without raising UnicodeEncodeError."""
+    test_msg = "Runtime error test: 🔥 rocket 🚀"
+    runtime.logger.error(test_msg)
+
+
+def test_stderr_utf8_reconfigure():
+    """Verify sys.stderr encoding handles non-ASCII characters gracefully."""
+    test_text = "Testing stderr with unicode: 🔥 🚀 café\n"
+    sys.stderr.write(test_text)
+    sys.stderr.flush()
+
+
+def test_resolve_session_path_special_cases():
+    """Verify empty, absolute, and :memory: sessions return untouched."""
+    assert runtime._resolve_session_path("") == ""
+    assert runtime._resolve_session_path(None) is None
+    assert runtime._resolve_session_path(":memory:") == ":memory:"
+    abs_path = os.path.abspath("some/path/my_session.session")
+    assert runtime._resolve_session_path(abs_path) == abs_path
+
+
+def test_resolve_session_path_resolves_existing_in_project_root(tmp_path, monkeypatch):
+    """Verify relative session name resolves to project root when session file exists there."""
+    fake_root = tmp_path / "project"
+    fake_root.mkdir()
+    session_file = fake_root / "my_custom.session"
+    session_file.touch()
+
+    monkeypatch.setattr(runtime, "PROJECT_ROOT", str(fake_root))
+
+    # Even if current directory is somewhere else
+    sub_dir = tmp_path / "other_dir"
+    sub_dir.mkdir()
+    monkeypatch.chdir(sub_dir)
+
+    resolved = runtime._resolve_session_path("my_custom")
+    assert resolved == str(fake_root / "my_custom")
+
+
+def test_resolve_session_path_resolves_in_subdirectory(tmp_path, monkeypatch):
+    """Verify relative session name resolves to project root when invoked from a subdirectory."""
+    fake_root = tmp_path / "project"
+    sub_dir = fake_root / "sub" / "deep"
+    sub_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(runtime, "PROJECT_ROOT", str(fake_root))
+    monkeypatch.chdir(sub_dir)
+
+    # Even if the file does not exist yet, running from a subdirectory resolves against project root
+    resolved = runtime._resolve_session_path("new_account")
+    assert resolved == str(fake_root / "new_account")
+
+
+def test_discover_accounts_resolves_session_name_against_project_root(tmp_path, monkeypatch):
+    """Verify _discover_accounts resolves TELEGRAM_SESSION_NAME against project root."""
+    fake_root = tmp_path / "project"
+    fake_root.mkdir()
+    (fake_root / "app_session.session").touch()
+
+    _clear_session_env(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_SESSION_NAME", "app_session")
+    monkeypatch.setattr(runtime, "PROJECT_ROOT", str(fake_root))
+    monkeypatch.setattr(runtime, "TelegramClient", _FakeTelegramClient)
+
+    # Run from outside root
+    other_dir = tmp_path / "outside"
+    other_dir.mkdir()
+    monkeypatch.chdir(other_dir)
+
+    accounts = runtime._discover_accounts()
+    assert "default" in accounts
+    assert accounts["default"].args[0] == str(fake_root / "app_session")
